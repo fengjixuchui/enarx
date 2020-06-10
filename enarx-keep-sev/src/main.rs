@@ -6,10 +6,13 @@
 #![deny(clippy::all)]
 #![deny(missing_docs)]
 
+mod vm;
+mod x86_64;
+
 use structopt::StructOpt;
 
-use std::error::Error;
 use std::fs::File;
+use std::io;
 use std::path::PathBuf;
 
 #[derive(StructOpt, Debug)]
@@ -34,11 +37,11 @@ fn main() {
     }
 }
 
-fn run(args: Args) -> Result<(), Box<dyn Error>> {
+fn run(args: Args) -> Result<(), io::Error> {
     let _kernel = File::open(args.shim)?;
     let _code = File::open(args.code)?;
 
-    // TODO: KVM context creation
+    let _vm = vm::VirtualMachine::new()?;
 
     // TODO: shim/code loading
 
