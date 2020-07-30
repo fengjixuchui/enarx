@@ -6,19 +6,21 @@
 #![deny(missing_docs)]
 
 mod builder;
-mod component;
 mod enclave;
 mod layout;
 
-use builder::Builder;
-use component::{Component, Segment};
+use builder::{Builder, Segment};
 use enclave::Leaf;
+use loader::{segment, Component};
 
+use bounds::Span;
 use intel_types::Exception;
 use memory::Page;
-use sgx_types::page::{Flags, SecInfo};
-use sgx_types::tcs::Tcs;
-use span::Span;
+use sallyport::Block;
+use sgx::types::{
+    page::{Flags, SecInfo},
+    tcs::Tcs,
+};
 use structopt::StructOpt;
 
 use std::path::PathBuf;
@@ -82,7 +84,7 @@ fn load() -> enclave::Enclave {
         },
         // Heap
         Segment {
-            si: SecInfo::reg(Flags::R | Flags::W),
+            si: SecInfo::reg(Flags::R | Flags::W | Flags::X),
             dst: layout.heap.start,
             src: vec![Page::default(); Span::from(layout.heap).count / Page::size()],
         },
@@ -94,32 +96,73 @@ fn load() -> enclave::Enclave {
         },
     ];
 
+    let to_si_seg = |s: segment::Segment| {
+        let mut rwx = Flags::empty();
+
+        if s.perms.read {
+            rwx |= Flags::R;
+        }
+        if s.perms.write {
+            rwx |= Flags::W;
+        }
+        if s.perms.execute {
+            rwx |= Flags::X;
+        }
+
+        Segment {
+            si: SecInfo::reg(rwx),
+            dst: s.dst,
+            src: s.src,
+        }
+    };
+
+    let shim_segs: Vec<Segment> = shim.segments.into_iter().map(to_si_seg).collect();
+    let code_segs: Vec<Segment> = code.segments.into_iter().map(to_si_seg).collect();
+
     // Initiate the enclave building process.
     let mut builder = Builder::new(layout.enclave).expect("Unable to create builder");
     builder.load(&internal).unwrap();
-    builder.load(&shim.segments).unwrap();
-    builder.load(&code.segments).unwrap();
+    builder.load(&shim_segs).unwrap();
+    builder.load(&code_segs).unwrap();
     builder.done(layout.prefix.start).unwrap()
 }
 
 fn main() {
     let enclave = load();
 
-    // The main loop event handing is divided into two halves.
-    //
-    //   1. EEXIT events (including syscall proxying and ERESUMEs [CSSA--])
-    //      are handled by the handler callback to the vDSO function. See
-    //      enclave.rs and enclave.S. This allows us to pass registers
-    //      directly to the syscall instruction.
-    //
-    //   2. Asynchronous exits (AEX) are handled here to minimize the amount
-    //      of assembly code used.
-    loop {
-        match enclave.enter(0, 0, 0, Leaf::Enter, 0, 0) {
-            // On InvalidOpcode: re-enter the enclave with EENTER (CSSA++).
-            Err(Some(ei)) if ei.trap == Exception::InvalidOpcode => (),
+    let mut block = Block::default();
+    let mut leaf = Leaf::Enter;
+    const SYS_ERESUME: usize = !0;
 
-            // We don't currently know how to handle other AEX events.
+    // The main loop event handles different types of enclave exits and
+    // re-enters the enclave with specific parameters.
+    //
+    //   1. Asynchronous exits (AEX) with an invalid opcode indicate
+    //      that a syscall should be performed. Execution continues in
+    //      the enclave with EENTER[CSSSA = 1]. The syscall
+    //      is proxied and potentially passed back out to the host.
+    //
+    //   2. OK with a syscall number other than SYS_ERESUME indicates the syscall
+    //      to be performed. The syscall is performed here and enclave
+    //      execution resumes with EENTER[CSSA = 1].
+    //
+    //   3. OK with a syscall number of SYS_ERESUME indicates that a syscall has
+    //      been performed as well as handled internally in the enclave
+    //      and normal enclave execution should resume
+    //      with ERESUME[CSSA = 0].
+    //
+    //   4. Asynchronous exits other than invalid opcode will panic.
+    loop {
+        leaf = match enclave.enter(&mut block as *const _ as _, 0, 0, leaf, 0, 0) {
+            Err(Some(ei)) if ei.trap == Exception::InvalidOpcode => Leaf::Enter,
+
+            Ok(_) if SYS_ERESUME == unsafe { block.msg.req.num }.into() => Leaf::Resume,
+
+            Ok(_) => {
+                block.msg.rep = unsafe { block.msg.req.syscall() };
+                Leaf::Enter
+            }
+
             e => panic!("Unexpected AEX: {:?}", e),
         }
     }

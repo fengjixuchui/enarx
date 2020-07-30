@@ -2,19 +2,20 @@
 
 use crate::Layout;
 
-use sgx_types::ssa::StateSaveArea;
-use span::{Contains, Line, Span};
+use memory::Register;
+use sallyport::{request, Block, Request};
+use sgx::types::ssa::StateSaveArea;
 
-use core::{mem::size_of, slice::from_raw_parts_mut};
+use core::convert::TryInto;
+use core::fmt::Write;
+use core::slice::{from_raw_parts, from_raw_parts_mut};
 
 const TRACE: bool = false;
-// The last 4095 numbers are errnos
-const ERRNO_BASE: u64 = !0xfff;
 
 // arch_prctl syscalls not available in the libc crate as of version 0.2.69
 enumerate::enumerate! {
     #[derive(Copy, Clone)]
-    enum ArchPrctlTask: u64 {
+    enum ArchPrctlTask: usize {
         ArchSetGs = 0x1001,
         ArchSetFs = 0x1002,
         ArchGetFs = 0x1003,
@@ -24,21 +25,7 @@ enumerate::enumerate! {
 
 extern "C" {
     #[no_mangle]
-    fn syscall(
-        rdi: u64,
-        rsi: u64,
-        rdx: u64,
-        aex: &mut StateSaveArea,
-        r8: u64,
-        r9: u64,
-        r10: u64,
-        rax: u64,
-        ctx: &Context,
-    ) -> u64;
-}
-
-pub trait Print<T: ?Sized> {
-    fn print(&mut self, data: &T);
+    fn syscall(aex: &mut StateSaveArea, ctx: &Context) -> u64;
 }
 
 pub enum Context {}
@@ -47,146 +34,60 @@ pub struct Handler<'a> {
     pub aex: &'a mut StateSaveArea,
     layout: &'a Layout,
     ctx: &'a Context,
+    block: &'a mut Block,
 }
 
-impl<'a> Print<str> for Handler<'a> {
-    fn print(&mut self, data: &str) {
-        let bytes = data.as_bytes();
-        let len = bytes.len() as _;
-
-        // Allocate some unencrypted memory.
-        let map = match self.ualloc(len) {
-            Err(_) => return,
-            Ok(map) => map,
-        };
-
-        unsafe {
-            // Copy the encrypted input into unencrypted memory.
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), map, bytes.len());
-
-            // Do the syscall; replace encrypted memory with unencrypted memory.
-            self.syscall(
-                libc::SYS_write as u64,
-                libc::STDERR_FILENO as u64,
-                map as _,
-                len,
-                0,
-                0,
-                0,
-            );
-
-            self.ufree(map, len);
-        }
-    }
-}
-
-fn hex(byte: u8) -> u8 {
-    match byte & 0xf {
-        0x0 => b'0',
-        0x1 => b'1',
-        0x2 => b'2',
-        0x3 => b'3',
-        0x4 => b'4',
-        0x5 => b'5',
-        0x6 => b'6',
-        0x7 => b'7',
-        0x8 => b'8',
-        0x9 => b'9',
-        0xa => b'a',
-        0xb => b'b',
-        0xc => b'c',
-        0xd => b'd',
-        0xe => b'e',
-        0xf => b'f',
-        _ => panic!(),
-    }
-}
-
-// Print a reverse hex dump for types that implement Copy
-//
-// The most common use for this is printing numbers, which are little endian.
-// Reversing the bytes makes the output big-endian hex.
-impl<'a, T: Copy> Print<T> for Handler<'a> {
-    fn print(&mut self, data: &T) {
-        let mut output = [*data, *data];
-        let output = unsafe { output.align_to_mut::<u8>().1 };
-
-        let input = [*data];
-        let input = unsafe { input.align_to::<u8>().1 };
-
-        for (i, byte) in input.iter().rev().cloned().enumerate() {
-            output[i * 2] = hex(byte >> 4);
-            output[i * 2 + 1] = hex(byte);
+impl<'a> Write for Handler<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if s.as_bytes().len() == 0 {
+            return Ok(());
         }
 
-        self.print(unsafe { core::str::from_utf8_unchecked(&output) })
+        let cursor = self.block.cursor();
+        let untrusted = cursor.copy_slice(s.as_bytes()).or(Err(core::fmt::Error))?;
+
+        let req = request!(libc::SYS_write => libc::STDERR_FILENO, untrusted, untrusted.len());
+        let res = unsafe { self.proxy(req) };
+
+        match res {
+            Ok(res) if usize::from(res[0]) > s.bytes().len() => self.attacked(),
+            Ok(res) if usize::from(res[0]) == s.bytes().len() => Ok(()),
+            _ => Err(core::fmt::Error),
+        }
     }
 }
 
 impl<'a> Handler<'a> {
     /// Create a new handler
-    pub fn new(layout: &'a Layout, aex: &'a mut StateSaveArea, ctx: &'a Context) -> Self {
-        Self { aex, ctx, layout }
+    pub fn new(
+        layout: &'a Layout,
+        aex: &'a mut StateSaveArea,
+        ctx: &'a Context,
+        block: &'a mut Block,
+    ) -> Self {
+        Self {
+            aex,
+            ctx,
+            layout,
+            block,
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn syscall(
-        &mut self,
-        rax: u64,
-        rdi: u64,
-        rsi: u64,
-        rdx: u64,
-        r10: u64,
-        r8: u64,
-        r9: u64,
-    ) -> u64 {
-        syscall(rdi, rsi, rdx, self.aex, r8, r9, r10, rax, self.ctx)
+    #[inline(never)]
+    unsafe fn proxy(&mut self, req: Request) -> sallyport::Result {
+        self.block.msg.req = req;
+
+        let _ret = syscall(self.aex, self.ctx);
+
+        self.block.msg.rep.into()
     }
 
-    /// TODO: https://github.com/enarx/enarx/issues/337
-    ///
-    /// We probably want a circuit breaker here. When we are under attack,
-    /// we trip the circuit breaker and exit the enclave. Any attempt to
-    /// re-enter the enclave after tripping the circuit breaker causes the
-    /// enclave to immediately EEXIT.
+    /// When we are under attack, we trip this circuit breaker and
+    /// exit the enclave. Any attempt to re-enter the enclave after
+    /// tripping the circuit breaker causes the enclave to immediately
+    /// EEXIT.
     pub fn attacked(&mut self) -> ! {
         self.exit(1)
-    }
-
-    /// Allocate a chunk of untrusted memory.
-    fn ualloc(&mut self, bytes: u64) -> Result<*mut u8, i64> {
-        let ret = unsafe {
-            self.syscall(
-                libc::SYS_mmap as u64,
-                0,
-                bytes,
-                libc::PROT_READ as u64 | libc::PROT_WRITE as u64,
-                libc::MAP_PRIVATE as u64 | libc::MAP_ANONYMOUS as u64,
-                !0,
-                0,
-            )
-        };
-
-        // Make sure the allocated memory is page-aligned and outside of the enclave.
-        let line = Line::from(Span {
-            start: ret,
-            count: bytes,
-        });
-        if self.layout.enclave.contains(&line) || ret & 0xfff != 0 {
-            self.attacked();
-        }
-
-        if ret > ERRNO_BASE {
-            return Err(-(ret as i64));
-        }
-
-        Ok(ret as *mut u8)
-    }
-
-    /// Free a chunk of untrusted memory.
-    unsafe fn ufree(&mut self, map: *mut u8, bytes: u64) -> u64 {
-        self.syscall(libc::SYS_munmap as u64, map as _, bytes, 0, 0, 0, 0)
     }
 
     fn trace(&mut self, name: &str, argc: usize) {
@@ -203,17 +104,13 @@ impl<'a> Handler<'a> {
             self.aex.gpr.r9,
         ];
 
-        self.print(name);
-        self.print("(");
-        for (i, arg) in argv[..argc].iter().enumerate() {
-            if i > 0 {
-                self.print(", ");
-            }
-
-            self.print(arg);
+        debug!(self, "{}(", name);
+        for (i, arg) in argv[..argc].iter().copied().enumerate() {
+            let prefix = if i > 0 { ", " } else { "" };
+            debug!(self, "{}0x{:x}", prefix, u64::from(arg));
         }
 
-        self.print(")\n");
+        debugln!(self, ")");
     }
 
     /// Proxy an exit() syscall
@@ -225,9 +122,11 @@ impl<'a> Handler<'a> {
         let code = code
             .into()
             .map(|x| x.into())
-            .unwrap_or_else(|| self.aex.gpr.rdi.raw());
+            .unwrap_or_else(|| self.aex.gpr.rdi);
+
+        #[allow(unused_must_use)]
         loop {
-            unsafe { self.syscall(libc::SYS_exit as u64, code, 0, 0, 0, 0, 0) };
+            unsafe { self.proxy(request!(libc::SYS_exit => code)) };
         }
     }
 
@@ -242,272 +141,156 @@ impl<'a> Handler<'a> {
         let code = code
             .into()
             .map(|x| x.into())
-            .unwrap_or_else(|| self.aex.gpr.rdi.raw());
+            .unwrap_or_else(|| self.aex.gpr.rdi);
+        #[allow(unused_must_use)]
         loop {
-            unsafe { self.syscall(libc::SYS_exit_group as u64, code, 0, 0, 0, 0, 0) };
+            unsafe { self.proxy(request!(libc::SYS_exit_group => code)) };
         }
     }
 
     /// Do a getuid() syscall
-    pub fn getuid(&mut self) -> u64 {
+    pub fn getuid(&mut self) -> sallyport::Result {
         self.trace("getuid", 0);
-
-        unsafe { self.syscall(libc::SYS_getuid as u64, 0, 0, 0, 0, 0, 0) }
+        unsafe { self.proxy(request!(libc::SYS_getuid)) }
     }
 
     /// Do a read() syscall
-    pub fn read(&mut self) -> u64 {
+    pub fn read(&mut self) -> sallyport::Result {
         self.trace("read", 3);
 
-        let fd = self.aex.gpr.rdi.raw();
-        let buf = self.aex.gpr.rsi.raw() as *mut u8;
-        let size = self.aex.gpr.rdx.raw();
+        let cursor = self.block.cursor();
+        let trusted: &mut [u8] = unsafe { self.aex.gpr.rsi.into_slice_mut(self.aex.gpr.rdx) };
+        let untrusted: &mut [u8] = unsafe { cursor.alloc(trusted.len()).or(Err(libc::EMSGSIZE))? };
 
-        // Allocate some unencrypted memory.
-        let map = match self.ualloc(size) {
-            Err(errno) => return errno as u64,
-            Ok(map) => map,
-        };
+        let req = request!(libc::SYS_read => self.aex.gpr.rdi, untrusted, untrusted.len());
+        let ret = unsafe { self.proxy(req)? };
 
-        unsafe {
-            // Do the syscall; replace encrypted memory with unencrypted memory.
-            let ret = self.syscall(libc::SYS_read as u64, fd, map as _, size, 0, 0, 0);
-
-            // Copy the unencrypted input into encrypted memory.
-            if ret <= ERRNO_BASE {
-                if ret > size {
-                    self.attacked();
-                }
-
-                core::ptr::copy_nonoverlapping(map, buf, ret as _);
-            }
-
-            self.ufree(map, size);
-            ret
+        if trusted.len() < ret[0].into() {
+            self.attacked();
         }
+
+        let cursor = self.block.cursor();
+        let untrusted: &mut [u8] = unsafe { cursor.alloc(trusted.len()).or(Err(libc::EMSGSIZE))? };
+        trusted.copy_from_slice(untrusted);
+        Ok(ret)
     }
 
     /// Do a write() syscall
-    pub fn write(&mut self) -> u64 {
+    pub fn write(&mut self) -> sallyport::Result {
         self.trace("write", 3);
 
-        let fd = self.aex.gpr.rdi.raw();
-        let buf = self.aex.gpr.rsi.raw() as *const u8;
-        let size = self.aex.gpr.rdx.raw();
+        let cursor = self.block.cursor();
+        let trusted: &[u8] = unsafe { self.aex.gpr.rsi.into_slice(self.aex.gpr.rdx) };
+        let untrusted = cursor.copy_slice(trusted).or(Err(libc::EMSGSIZE))?;
 
-        // Allocate some unencrypted memory.
-        let map = match self.ualloc(size) {
-            Err(errno) => return errno as u64,
-            Ok(map) => map,
-        };
+        let req = request!(libc::SYS_write => self.aex.gpr.rdi, untrusted, untrusted.len());
+        let res = unsafe { self.proxy(req)? };
 
-        unsafe {
-            // Copy the encrypted input into unencrypted memory.
-            core::ptr::copy_nonoverlapping(buf, map, size as _);
-
-            // Do the syscall; replace encrypted memory with unencrypted memory.
-            let ret = self.syscall(libc::SYS_write as u64, fd, map as _, size, 0, 0, 0);
-            self.ufree(map, size);
-
-            if ret <= ERRNO_BASE && ret > size {
-                self.attacked();
-            }
-
-            ret
+        if trusted.len() < res[0].into() {
+            self.attacked();
         }
+
+        Ok(res)
     }
 
     /// Do a set_tid_address() syscall
     // This is currently unimplemented and returns a dummy thread id.
-    pub fn set_tid_address(&mut self) -> u64 {
+    pub fn set_tid_address(&mut self) -> sallyport::Result {
         self.trace("set_tid_address", 1);
 
-        1
+        Ok([1.into(), 0.into()])
     }
 
     /// Do an arch_prctl() syscall
-    pub fn arch_prctl(&mut self) -> u64 {
-        // TODO: Check that addr in %rdx does not point to an unmapped address
-        // and is not outside of the process address space.
-
+    pub fn arch_prctl(&mut self) -> sallyport::Result {
         self.trace("arch_prctl", 2);
 
-        match ArchPrctlTask::from(self.aex.gpr.rdi.raw()) {
-            ArchPrctlTask::ArchSetFs => {
-                self.aex.gpr.fsbase = self.aex.gpr.rsi;
-                0
-            }
-
-            // TODO: Fix me
-            ArchPrctlTask::ArchGetFs => -libc::ENOSYS as u64,
-
-            ArchPrctlTask::ArchSetGs => {
-                self.aex.gpr.gsbase = self.aex.gpr.rsi;
-                0
-            }
-
-            // TODO: Fix me
-            ArchPrctlTask::ArchGetGs => -libc::ENOSYS as u64,
-
-            _ => -libc::EINVAL as u64,
+        // TODO: Check that addr in %rdx does not point to an unmapped address
+        // and is not outside of the process address space.
+        match ArchPrctlTask::from(usize::from(self.aex.gpr.rdi)) {
+            ArchPrctlTask::ArchSetFs => self.aex.gpr.fsbase = self.aex.gpr.rsi,
+            ArchPrctlTask::ArchSetGs => self.aex.gpr.gsbase = self.aex.gpr.rsi,
+            ArchPrctlTask::ArchGetFs => return Err(libc::ENOSYS),
+            ArchPrctlTask::ArchGetGs => return Err(libc::ENOSYS),
+            _ => return Err(libc::EINVAL),
         }
+
+        Ok(Default::default())
     }
 
     /// Do a readv() syscall
-    pub fn readv(&mut self) -> u64 {
+    pub fn readv(&mut self) -> sallyport::Result {
         self.trace("readv", 3);
 
-        let fd = self.aex.gpr.rdi.raw();
-        let trusted = unsafe {
-            from_raw_parts_mut(
-                self.aex.gpr.rsi.raw() as *mut libc::iovec,
-                self.aex.gpr.rdx.raw() as usize,
-            )
-        };
+        let mut size = 0usize;
+        let cursor = self.block.cursor();
+        let trusted = unsafe { self.aex.gpr.rsi.into_slice_mut(self.aex.gpr.rdx) };
+        let untrusted: &mut [libc::iovec] = cursor.copy_slice(trusted).or(Err(libc::EMSGSIZE))?;
 
-        // Add up total size of buffers and size of iovec array.
-        let bufsize = trusted.iter().fold(0, |a, e| a + e.iov_len);
-        let iovecsize = size_of::<libc::iovec>() * trusted.len();
-        let size = bufsize + iovecsize;
+        for (t, u) in trusted.iter_mut().zip(untrusted.iter_mut()) {
+            let us: &mut [u8] = unsafe { cursor.alloc(t.iov_len).or(Err(libc::EMSGSIZE))? };
+            u.iov_base = us.as_mut_ptr() as _;
+            size += u.iov_len;
+        }
 
-        // Allocate some unencrypted memory.
-        let map = match self.ualloc(size as u64) {
-            Err(errno) => return errno as u64,
-            Ok(map) => unsafe { from_raw_parts_mut(map, size as usize) },
-        };
+        let req = request!(libc::SYS_readv => self.aex.gpr.rdi, untrusted, untrusted.len());
+        let ret = unsafe { self.proxy(req)? };
 
-        // Split allocated memory into that used by the iovec struct array and that used by its buffers.
-        let (uiovec, ubuffer) = map.split_at_mut(iovecsize);
-
-        // Convert the prefix from a byte slice into an iovec slice.
-        let (_, untrusted, _) = unsafe { uiovec.align_to_mut::<libc::iovec>() };
-        if untrusted.len() != trusted.len() {
+        let mut read = ret[0].into();
+        if size < read {
             self.attacked();
         }
 
-        // Set pointers in unencrypted iovec slice to use the rest of the allocated memory.
-        // The offset is into the buffer area allocated immediately after the iovec struct
-        // array, measured in bytes.
-        let mut offset = 0;
-        for (t, mut u) in trusted.iter_mut().zip(untrusted.iter_mut()) {
-            u.iov_base = ubuffer[offset..].as_mut_ptr() as *mut _;
-            u.iov_len = t.iov_len;
-            offset += t.iov_len;
+        let cursor = self.block.cursor();
+        let _: &mut [libc::iovec] = unsafe { cursor.alloc(trusted.len()).or(Err(libc::EMSGSIZE))? };
+        for t in trusted.iter_mut() {
+            let ts: &mut [u8] = unsafe { from_raw_parts_mut(t.iov_base as _, t.iov_len) };
+            let us: &mut [u8] = unsafe { cursor.alloc(ts.len()).or(Err(libc::EMSGSIZE))? };
+            let sz = core::cmp::min(ts.len(), read);
+            ts[..sz].copy_from_slice(&us[..sz]);
+            read -= sz;
         }
 
-        // Do the syscall; replace encrypted memory with unencrypted memory.
-        let ret = unsafe {
-            self.syscall(
-                libc::SYS_readv as u64,
-                fd,
-                untrusted.as_ptr() as _,
-                untrusted.len() as u64,
-                0,
-                0,
-                0,
-            )
-        };
-
-        // Copy the unencrypted input into encrypted memory.
-        if ret <= ERRNO_BASE {
-            if ret > size as u64 {
-                self.attacked();
-            }
-
-            let mut offset = 0;
-            for (t, u) in trusted.iter_mut().zip(untrusted.iter_mut()) {
-                if u.iov_base != ubuffer[offset..].as_mut_ptr() as *mut _ || u.iov_len != t.iov_len
-                {
-                    self.attacked();
-                }
-
-                t.clone_from(u);
-                offset += t.iov_len;
-            }
-        }
-
-        unsafe { self.ufree(map.as_ptr() as *mut u8, size as u64) };
-        ret
+        Ok(ret)
     }
 
     /// Do a writev() syscall
-    pub fn writev(&mut self) -> u64 {
+    pub fn writev(&mut self) -> sallyport::Result {
         self.trace("writev", 3);
 
-        let fd = self.aex.gpr.rdi.raw();
-        let trusted = unsafe {
-            from_raw_parts_mut(
-                self.aex.gpr.rsi.raw() as *mut libc::iovec,
-                self.aex.gpr.rdx.raw() as usize,
-            )
-        };
+        let mut size = 0usize;
+        let cursor = self.block.cursor();
+        let trusted = unsafe { self.aex.gpr.rsi.into_slice_mut(self.aex.gpr.rdx) };
+        let untrusted: &mut [libc::iovec] = cursor.copy_slice(trusted).or(Err(libc::EMSGSIZE))?;
 
-        // Add up total size of buffers and size of iovec array.
-        let bufsize = trusted.iter().fold(0, |a, e| a + e.iov_len);
-        let iovecsize = size_of::<libc::iovec>() * trusted.len();
-        let size = bufsize + iovecsize;
+        for (t, mut u) in trusted.iter_mut().zip(untrusted.iter_mut()) {
+            let ts = unsafe { from_raw_parts(t.iov_base as *const u8, t.iov_len) };
+            let us = cursor.copy_slice(ts).or(Err(libc::EMSGSIZE))?;
+            u.iov_base = us.as_mut_ptr() as _;
+            size += u.iov_len;
+        }
 
-        // Allocate some unencrypted memory.
-        let map = match self.ualloc(size as u64) {
-            Err(errno) => return errno as u64,
-            Ok(map) => unsafe { from_raw_parts_mut(map, size as usize) },
-        };
+        let req = request!(libc::SYS_writev => self.aex.gpr.rdi, untrusted, untrusted.len());
+        let ret = unsafe { self.proxy(req)? };
 
-        // Split allocated memory into that used by the iovec struct array
-        // and that used by its buffers.
-        let (uiovec, ubuffer) = map.split_at_mut(iovecsize);
-
-        // Convert the prefix from a byte slice into an iovec slice.
-        let (_, untrusted, _) = unsafe { uiovec.align_to_mut::<libc::iovec>() };
-        if untrusted.len() != trusted.len() {
+        if size < ret[0].into() {
             self.attacked();
         }
 
-        // Set pointers in unencrypted iovec slice to use the rest
-        // of the allocated memory, then copy the encrypted input
-        // into unencrypted memory. The offset is into the buffer
-        // area allocated immediately after the iovec struct array,
-        // measured in bytes.
-        let mut offset = 0;
-        for (t, mut u) in trusted.iter_mut().zip(untrusted.iter_mut()) {
-            u.iov_base = ubuffer[offset..].as_mut_ptr() as *mut _;
-            u.iov_len = t.iov_len;
-            u.clone_from(t);
-            offset += t.iov_len;
-        }
-
-        // Do the syscall; replace encrypted memory with unencrypted memory.
-        let ret = unsafe {
-            self.syscall(
-                libc::SYS_writev as u64,
-                fd,
-                untrusted.as_ptr() as _,
-                untrusted.len() as u64,
-                0,
-                0,
-                0,
-            )
-        };
-
-        unsafe { self.ufree(map.as_ptr() as *mut u8, size as u64) };
-
-        if ret <= ERRNO_BASE && ret > size as u64 {
-            self.attacked()
-        }
-
-        ret
+        Ok(ret)
     }
 
     /// Do a brk() system call
-    pub fn brk(&mut self) -> u64 {
+    pub fn brk(&mut self) -> sallyport::Result {
         self.trace("brk", 1);
 
         let mut heap = unsafe { crate::heap::Heap::new(self.layout.heap.into()) };
-        heap.brk(self.aex.gpr.rdi.raw() as _) as _
+        let ret = heap.brk(self.aex.gpr.rdi.into());
+        Ok([ret.into(), Default::default()])
     }
 
     /// Do a uname() system call
-    pub fn uname(&mut self) -> u64 {
+    pub fn uname(&mut self) -> sallyport::Result {
         self.trace("uname", 1);
 
         fn fill(buf: &mut [i8; 65], with: &str) {
@@ -517,64 +300,68 @@ impl<'a> Handler<'a> {
             }
         }
 
-        let utsname = unsafe { &mut *(self.aex.gpr.rdi.raw() as *mut libc::utsname) };
-        fill(&mut utsname.sysname, "Linux");
-        fill(&mut utsname.nodename, "localhost.localdomain");
-        fill(&mut utsname.release, "5.6.0");
-        fill(&mut utsname.version, "#1");
-        fill(&mut utsname.machine, "x86_64");
+        let u: *mut libc::utsname = self.aex.gpr.rdi.into();
+        let u = unsafe { &mut *u };
+        fill(&mut u.sysname, "Linux");
+        fill(&mut u.nodename, "localhost.localdomain");
+        fill(&mut u.release, "5.6.0");
+        fill(&mut u.version, "#1");
+        fill(&mut u.machine, "x86_64");
 
-        0
+        Ok(Default::default())
     }
 
     /// Do a mprotect() system call
     // Until EDMM, we can't change any page permissions.
     // What you get is what you get. Fake success.
-    pub fn mprotect(&mut self) -> u64 {
+    pub fn mprotect(&mut self) -> sallyport::Result {
         self.trace("mprotect", 3);
 
-        0
+        Ok(Default::default())
     }
 
     /// Do a mmap() system call
-    pub fn mmap(&mut self) -> u64 {
+    pub fn mmap(&mut self) -> sallyport::Result {
         self.trace("mmap", 6);
 
         let mut heap = unsafe { crate::heap::Heap::new(self.layout.heap.into()) };
-        heap.mmap(
-            self.aex.gpr.rdi.raw() as _,
-            self.aex.gpr.rsi.raw() as _,
-            self.aex.gpr.rdx.raw() as _,
-            self.aex.gpr.r10.raw() as _,
-            self.aex.gpr.r8.raw() as _,
-            self.aex.gpr.r9.raw() as _,
-        ) as _
+        let ret = heap.mmap::<libc::c_void>(
+            self.aex.gpr.rdi.into(),
+            self.aex.gpr.rsi.into(),
+            self.aex.gpr.rdx.try_into().or(Err(libc::EINVAL))?,
+            self.aex.gpr.r10.try_into().or(Err(libc::EINVAL))?,
+            usize::from(self.aex.gpr.r8) as _, // Allow truncation!
+            self.aex.gpr.r9.into(),
+        )?;
+
+        Ok([ret.into(), Default::default()])
     }
 
     /// Do a munmap() system call
-    pub fn munmap(&mut self) -> u64 {
+    pub fn munmap(&mut self) -> sallyport::Result {
         self.trace("munmap", 2);
 
         let mut heap = unsafe { crate::heap::Heap::new(self.layout.heap.into()) };
-        heap.munmap(self.aex.gpr.rdi.raw() as _, self.aex.gpr.rsi.raw() as _) as _
+        heap.munmap::<libc::c_void>(self.aex.gpr.rdi.into(), self.aex.gpr.rsi.into())?;
+        Ok(Default::default())
     }
 
     /// Do a rt_sigaction() system call
     // We don't support signals yet. So, fake success.
-    pub fn rt_sigaction(&mut self) -> u64 {
-        type SigAction = [u64; 4];
-
-        static mut ACTIONS: [SigAction; 64] = [[0; 4]; 64];
-
+    pub fn rt_sigaction(&mut self) -> sallyport::Result {
         self.trace("rt_sigaction", 4);
 
-        let signal = self.aex.gpr.rdi.raw() as usize;
-        let new = self.aex.gpr.rsi.raw() as *const SigAction;
-        let old = self.aex.gpr.rdx.raw() as *mut SigAction;
-        let size = self.aex.gpr.r10.raw();
+        type SigAction = [u64; 4];
+        const SIGRTMAX: usize = 64; // TODO: add to libc crate
+        static mut ACTIONS: [SigAction; SIGRTMAX] = [[0; 4]; SIGRTMAX];
 
-        if signal >= unsafe { ACTIONS.len() } || size != 8 {
-            return -libc::EINVAL as u64;
+        let signal: usize = self.aex.gpr.rdi.into();
+        let new: *const SigAction = self.aex.gpr.rsi.into();
+        let old: *mut SigAction = self.aex.gpr.rdx.into();
+        let size: usize = self.aex.gpr.r10.into();
+
+        if signal >= SIGRTMAX || size != 8 {
+            return Err(libc::EINVAL);
         }
 
         unsafe {
@@ -589,38 +376,77 @@ impl<'a> Handler<'a> {
             }
         }
 
-        0
+        Ok(Default::default())
     }
 
     /// Do a rt_sigprocmask() system call
     // We don't support signals yet. So, fake success.
-    pub fn rt_sigprocmask(&mut self) -> u64 {
+    pub fn rt_sigprocmask(&mut self) -> sallyport::Result {
         self.trace("rt_sigprocmask", 4);
 
-        0
+        Ok(Default::default())
     }
 
     /// Do a sigaltstack() system call
     // We don't support signals yet. So, fake success.
-    pub fn sigaltstack(&mut self) -> u64 {
+    pub fn sigaltstack(&mut self) -> sallyport::Result {
         self.trace("sigaltstack", 2);
 
-        0
+        Ok(Default::default())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn errno_values() {
-        assert_eq!(-22i64 as u64, -libc::EINVAL as u64);
-        // ERRNO return values are the last 4096 numbers in a u64
-        let ret = -libc::EINVAL as u64;
-        assert_eq!(Some(libc::EINVAL as i64), Some(-(ret as i64)));
+    /// Do a getrandom() syscall
+    pub fn getrandom(&mut self) -> sallyport::Result {
+        self.trace("getrandom", 3);
+
+        let flags: libc::c_uint = self.aex.gpr.rdx.try_into().or(Err(libc::EINVAL))?;
+        let flags = flags & !(libc::GRND_NONBLOCK | libc::GRND_RANDOM);
+
+        if flags != 0 {
+            return Err(libc::EINVAL);
+        }
+
+        let trusted: &mut [u8] = unsafe { self.aex.gpr.rdi.into_slice_mut(self.aex.gpr.rsi) };
+
+        for (i, chunk) in trusted.chunks_mut(8).enumerate() {
+            let mut el = 0u64;
+            loop {
+                if unsafe { core::arch::x86_64::_rdrand64_step(&mut el) } == 1 {
+                    chunk.copy_from_slice(&el.to_ne_bytes()[..chunk.len()]);
+                    break;
+                } else {
+                    if flags & libc::GRND_NONBLOCK != 0 {
+                        return Err(libc::EAGAIN);
+                    }
+                    if flags & libc::GRND_RANDOM != 0 {
+                        return Ok([(i * 8).into(), Default::default()]);
+                    }
+                }
+            }
+        }
+
+        Ok([trusted.len().into(), Default::default()])
     }
-    #[test]
-    fn syscall_values() {
-        assert_eq!(0u64, libc::SYS_read as u64);
-        assert_eq!(libc::SYS_read, 0i64 as i64);
+
+    // Do clock_gettime syscall
+    pub fn clock_gettime(&mut self) -> sallyport::Result {
+        self.trace("clock_gettime", 2);
+
+        let clk_id = self.aex.gpr.rdi;
+        let trusted = unsafe { self.aex.gpr.rsi.into_slice_mut(1usize) };
+
+        let cursor = self.block.cursor();
+        let untrusted = unsafe { cursor.alloc::<libc::timespec>(1).or(Err(libc::EMSGSIZE))? };
+        let req = request!(libc::SYS_clock_gettime => clk_id, untrusted);
+        let res = unsafe { self.proxy(req)? };
+
+        if 0usize != res[0].into() {
+            self.attacked();
+        }
+
+        let cursor = self.block.cursor();
+        let untrusted = unsafe { cursor.alloc::<libc::timespec>(1).or(Err(libc::EMSGSIZE))? };
+        trusted.copy_from_slice(untrusted);
+        Ok(res)
     }
 }

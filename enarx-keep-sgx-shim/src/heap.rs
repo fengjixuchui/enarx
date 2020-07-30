@@ -3,8 +3,8 @@
 use core::mem::size_of;
 use core::slice::from_raw_parts_mut as slice;
 
+use bounds::{Line, Span};
 use memory::Page;
-use span::{Line, Span};
 
 type Word = usize;
 
@@ -85,8 +85,12 @@ impl Heap {
         let base = self.pages.as_ptr() as usize;
         let ceil = base + self.pages.len() * Page::size();
 
-        if base <= addr && addr < ceil {
-            return Some(addr - base);
+        if base <= addr {
+            if addr < ceil {
+                return Some(addr - base);
+            } else {
+                return Some(ceil - base);
+            }
         }
 
         None
@@ -128,21 +132,21 @@ impl Heap {
         brk
     }
 
-    pub fn mmap(
+    pub fn mmap<T>(
         &mut self,
-        addr: usize,
-        length: usize,
-        prot: usize,
-        flags: usize,
-        fd: isize,
-        offset: usize,
-    ) -> usize {
-        const RWX: i32 = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-        const PA: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        addr: libc::size_t,
+        length: libc::size_t,
+        prot: libc::c_int,
+        flags: libc::c_int,
+        fd: libc::c_int,
+        offset: libc::off_t,
+    ) -> Result<*mut T, libc::c_int> {
+        const RWX: libc::c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        const PA: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
 
-        let prot = prot as u64 & !(RWX as u64);
-        if addr != 0 || fd != -1 || offset != 0 || prot != 0 || flags as u64 != PA as u64 {
-            return -libc::EINVAL as _;
+        let prot = prot & !RWX;
+        if addr != 0 || fd != -1 || offset != 0 || prot != 0 || flags != PA {
+            return Err(libc::EINVAL);
         }
 
         // The number of pages we need for the given length.
@@ -151,8 +155,13 @@ impl Heap {
         // Find the brk page offset.
         let brk = self.offset_page_up(self.metadata.brk.end).unwrap();
 
+        let end = match self.pages.len().checked_sub(pages) {
+            Some(end) => end,
+            None => return Err(libc::ENOMEM),
+        };
+
         // Search for pages from the end to the front.
-        for i in (brk..=self.pages.len() - pages).rev() {
+        for i in (brk..=end).rev() {
             let range = i..i + pages;
 
             if !self.is_allocated_range(range.clone()) {
@@ -160,47 +169,160 @@ impl Heap {
                     self.allocate(page);
                 }
 
-                return self.pages[range].as_ptr() as _;
+                return Ok(self.pages[range].as_mut_ptr() as *mut T);
             }
         }
 
-        -libc::ENOMEM as _
+        Err(libc::ENOMEM)
     }
 
-    pub fn munmap(&mut self, addr: usize, length: usize) -> usize {
+    pub fn munmap<T>(&mut self, addr: *const T, length: usize) -> Result<(), libc::c_int> {
+        let addr = addr as usize;
+
         if addr % Page::size() != 0 {
-            return -libc::EINVAL as _;
+            return Err(libc::EINVAL);
         }
 
         let brk = self.offset_page_up(self.metadata.brk.end).unwrap();
 
         let bot = match self.offset_page_down(addr) {
             Some(page) => page,
-            None => return -libc::EINVAL as _,
+            None => return Err(libc::EINVAL),
         };
 
         let top = match self.offset_page_up(addr + length) {
             Some(page) => page,
-            None => return -libc::EINVAL as _,
+            None => return Err(libc::EINVAL),
         };
 
         if bot < brk {
-            return -libc::EINVAL as _;
+            return Err(libc::EINVAL);
         }
 
         for page in bot..top {
             self.deallocate(page);
         }
 
-        0
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use core::ptr::null_mut;
+    use libc::c_void;
+
+    const PROT: libc::c_int = libc::PROT_READ;
+    const FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    const NUM_PAGES: usize = 10;
+
+    fn new_checked(bytes: &mut [u8]) -> Heap {
+        let aligned = unsafe { bytes.align_to_mut::<Page>().1 };
+        let span = Span {
+            start: aligned.as_mut_ptr() as _,
+            count: (aligned.len() * Page::size()) as _,
+        };
+        let heap = unsafe { Heap::new(span) };
+
+        // brk points to the first page
+        assert_eq!(heap.metadata.brk.start, heap.pages.as_ptr() as _);
+        assert_eq!(heap.metadata.brk.end, heap.pages.as_ptr() as _);
+
+        // exclude 2 pages for metadata and allocation map
+        assert_eq!(heap.pages.len(), aligned.len() - 2);
+
+        // no pages are allocated
+        for page in 0..heap.pages.len() {
+            assert!(!heap.is_allocated(page));
+        }
+
+        heap
+    }
+
+    fn oneshot(heap: &mut Heap, pages: usize) {
+        let brk_page = heap.pages.len() - pages;
+        let brk = heap.metadata.brk.start + brk_page * Page::size();
+        let ret = heap.brk(brk);
+        assert_eq!(ret, brk);
+
+        let steps = [
+            (Page::size(), 1),
+            (Page::size() / 2, 1),
+            (Page::size() + Page::size() / 2, 2),
+            (pages * Page::size(), pages),
+        ];
+
+        for (s, allocated) in steps.iter() {
+            let addr = heap.mmap(0, *s, PROT, FLAGS, -1, 0).unwrap();
+
+            for page in brk_page..heap.pages.len() - allocated {
+                assert!(!heap.is_allocated(page));
+            }
+            for page in heap.pages.len() - allocated..heap.pages.len() {
+                assert!(heap.is_allocated(page));
+            }
+
+            heap.munmap::<c_void>(addr, *s).unwrap();
+        }
+
+        // try to allocate memory whose size exceeds the total heap size
+        let len = heap.pages.len() * Page::size() + 1;
+        let ret = heap.mmap::<c_void>(0, len, PROT, FLAGS, -1, 0);
+        assert_eq!(ret.unwrap_err(), libc::ENOMEM);
+    }
+
     #[test]
-    fn const_values() {
-        assert_eq!(1u64, libc::PROT_READ as u64);
-        assert_eq!(1u64 as libc::c_int, libc::PROT_READ);
+    fn mmap_munmap_oneshot() {
+        let bytes = &mut [0; Page::size() * NUM_PAGES];
+        let mut heap = new_checked(bytes);
+
+        let pages = heap.pages.len();
+        oneshot(&mut heap, pages);
+        oneshot(&mut heap, pages / 2);
+    }
+
+    fn incremental(heap: &mut Heap, pages: usize) {
+        let brk_page = heap.pages.len() - pages;
+        let brk = heap.metadata.brk.start + brk_page * Page::size();
+        let ret = heap.brk(brk);
+        assert_eq!(ret, brk);
+
+        let steps = [Page::size(), Page::size() / 2];
+
+        for s in steps.iter() {
+            let mut addrs = [null_mut::<libc::c_void>(); NUM_PAGES];
+
+            for i in brk_page..heap.pages.len() {
+                let addr = heap.mmap(0, *s, PROT, FLAGS, -1, 0).unwrap();
+                addrs[i] = addr;
+            }
+
+            for page in brk_page..heap.pages.len() {
+                assert!(heap.is_allocated(page));
+            }
+
+            // try to allocate memory but no free pages
+            let ret = heap.mmap::<c_void>(0, *s, PROT, FLAGS, -1, 0);
+            assert_eq!(ret.unwrap_err(), libc::ENOMEM);
+
+            for i in brk_page..heap.pages.len() {
+                heap.munmap(addrs[i], *s).unwrap();
+            }
+
+            for page in brk_page..heap.pages.len() {
+                assert!(!heap.is_allocated(page));
+            }
+        }
+    }
+
+    #[test]
+    fn mmap_munmap_incremental() {
+        let bytes = &mut [0; Page::size() * NUM_PAGES];
+        let mut heap = new_checked(bytes);
+
+        let pages = heap.pages.len();
+        incremental(&mut heap, pages);
+        incremental(&mut heap, pages / 2);
     }
 }

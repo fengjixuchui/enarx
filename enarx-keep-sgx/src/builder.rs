@@ -1,19 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::component::Segment;
 use super::enclave::Enclave;
 
-use iocuddle_sgx as sgx;
+use bounds::Span;
 use memory::Page;
 use openssl::{bn, rsa};
-use sgx_crypto::{Hasher, Signer};
-use sgx_types::page::{Class, Flags, SecInfo};
-use sgx_types::{secs::*, sig::*, ssa::StateSaveArea};
-use span::Span;
+use sgx::{
+    crypto::{Hasher, Signer},
+    ioctls,
+    types::{
+        page::{Class, Flags, SecInfo},
+        {secs::*, sig::*, ssa::StateSaveArea},
+    },
+};
 
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
 use std::io::Result;
+
+pub struct Segment {
+    pub src: Vec<Page>,
+    pub dst: usize,
+    pub si: SecInfo,
+}
 
 fn f2p(flags: Flags) -> libc::c_int {
     let mut prot = libc::PROT_NONE;
@@ -63,8 +72,8 @@ impl Builder {
         // Create the enclave.
         let sign = Parameters::default();
         let secs = Secs::new(span, StateSaveArea::frame_size(), sign);
-        let create = sgx::Create::new(&secs);
-        sgx::ENCLAVE_CREATE.ioctl(&mut file, &create)?;
+        let create = ioctls::Create::new(&secs);
+        ioctls::ENCLAVE_CREATE.ioctl(&mut file, &create)?;
 
         Ok(Self {
             sign,
@@ -76,14 +85,19 @@ impl Builder {
     }
 
     pub fn load(&mut self, segs: &[Segment]) -> Result<()> {
-        const FLAGS: sgx::Flags = sgx::Flags::MEASURE;
+        const FLAGS: ioctls::Flags = ioctls::Flags::MEASURE;
 
         for seg in segs {
+            // Ignore segments with no pages.
+            if seg.src.len() == 0 {
+                continue;
+            }
+
             let off = seg.dst - self.mmap.span().start;
 
             // Update the enclave.
-            let mut ap = sgx::AddPages::new(&seg.src, off, &seg.si, FLAGS);
-            sgx::ENCLAVE_ADD_PAGES.ioctl(&mut self.file, &mut ap)?;
+            let mut ap = ioctls::AddPages::new(&seg.src, off, &seg.si, FLAGS);
+            ioctls::ENCLAVE_ADD_PAGES.ioctl(&mut self.file, &mut ap)?;
 
             // Update the hash.
             self.hash.add(&seg.src, off, seg.si, true);
@@ -106,13 +120,13 @@ impl Builder {
         let exp = bn::BigNum::try_from(3u32)?;
         let key = rsa::Rsa::generate_with_e(3072, &exp)?;
 
-        // Create the enclave signature.
-        let vendor = Vendor::UNKNOWN.author(0, 0);
+        // Create the enclave signature
+        let vendor = Author::new(0, 0);
         let sig = key.sign(vendor, self.hash.finish(self.sign))?;
 
         // Initialize the enclave.
-        let init = sgx::Init::new(&sig);
-        sgx::ENCLAVE_INIT.ioctl(&mut self.file, &init)?;
+        let init = ioctls::Init::new(&sig);
+        ioctls::ENCLAVE_INIT.ioctl(&mut self.file, &init)?;
 
         // Fix up mapped permissions.
         self.perm.sort_by(|l, r| l.0.start.cmp(&r.0.start));
@@ -135,7 +149,7 @@ impl Builder {
                 )?;
             }
 
-            //let line = span::Line::from(span);
+            //let line = bounds::Line::from(span);
             //eprintln!("{:016x}-{:016x} {:?}", line.start, line.end, si);
         }
 

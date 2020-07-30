@@ -131,9 +131,15 @@ macro_rules! implfrom {
 }
 
 implfrom! {
-    u8:i8       [u16:i16 u32:i32 u64:i64 u128:i128],
-    u16:i16     [u32:i32 u64:i64 u128:i128],
-    u32:i32     [u64:i64 u128:i128],
+    u8:i8       [u16:i16 u32:i32 u64:i64 u128:i128 usize:isize],
+    u16:i16     [u32:i32 u64:i64 u128:i128 usize:isize],
+
+    #[cfg(target_pointer_width = "64")]
+    u32:i32     [u64:i64 u128:i128 usize:isize],
+
+    #[cfg(target_pointer_width = "32")]
+    u32:i32     [u64:i64 u128:i128] usize:isize,
+
     u64:i64     [u128:i128],
     u128:i128   [],
 
@@ -147,26 +153,71 @@ implfrom! {
 macro_rules! implptr {
     () => {};
 
-    ($(#[$attr:meta])? $t:ident $m:tt) => {
-        impl<T> From<Register<$t>> for *$m T {
-            #[inline]
-            fn from(value: Register<$t>) -> *$m T {
-                value.0 as _
-            }
-        }
-
-        impl<T> From<*$m T> for Register<$t> {
-            #[inline]
-            fn from(value: *$m T) -> Register<$t> {
-                Self(value as _)
-            }
-        }
-    };
-
     ($($(#[$attr:meta])? $t:ident),* $(,)?) => {
         $(
-            implptr! { $(#[$attr])? $t const }
-            implptr! { $(#[$attr])? $t mut }
+            $(#[$attr])?
+            impl<T: Sized> From<Register<$t>> for *mut T {
+                #[inline]
+                fn from(value: Register<$t>) -> *mut T {
+                    value.0 as _
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<Register<$t>> for *const T {
+                #[inline]
+                fn from(value: Register<$t>) -> *const T {
+                    value.0 as _
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<*mut T> for Register<$t> {
+                #[inline]
+                fn from(value: *mut T) -> Register<$t> {
+                    Self(value as _)
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<*const T> for Register<$t> {
+                #[inline]
+                fn from(value: *const T) -> Register<$t> {
+                    Self(value as _)
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<&mut [T]> for Register<$t> {
+                #[inline]
+                fn from(value: &mut [T]) -> Register<$t> {
+                    Self(value.as_mut_ptr() as $t)
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<&[T]> for Register<$t> {
+                #[inline]
+                fn from(value: &[T]) -> Register<$t> {
+                    Self(value.as_ptr() as $t)
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<&mut T> for Register<$t> {
+                #[inline]
+                fn from(value: &mut T) -> Register<$t> {
+                    Self(value as *mut T as $t)
+                }
+            }
+
+            $(#[$attr])?
+            impl<T: Sized> From<&T> for Register<$t> {
+                #[inline]
+                fn from(value: &T) -> Register<$t> {
+                    Self(value as *const T as $t)
+                }
+            }
         )*
     };
 }
@@ -191,18 +242,83 @@ implptr! {
 /// underlying types so long as the conversion does not truncate. For example,
 /// `Register<u64>` can be converted to `Register<usize>` on 64-bit systems.
 /// Likewise, `Register<usize>` can be converted to and from a pointer.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(transparent)]
 pub struct Register<T>(T);
 
 impl<T> Register<T> {
-    /// Create a `Register` value from the raw contents
-    pub fn from_raw(value: T) -> Self {
-        Self(value)
+    /// Converts a register value to a slice
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because we are converting an integer to a
+    /// pointer and then dereferencing it. The caller MUST ensure that
+    /// the value of this register points to valid memory.
+    #[inline]
+    pub unsafe fn into_slice<'a, U>(self, len: impl Into<usize>) -> &'a [U]
+    where
+        Self: Into<*const U>,
+    {
+        core::slice::from_raw_parts(self.into(), len.into())
     }
 
-    /// Returns the raw value
-    pub fn raw(self) -> T {
-        self.0
+    /// Converts a register value to a mutable slice
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because we are converting an integer to a
+    /// pointer and then dereferencing it. The caller MUST ensure that
+    /// the value of this register is valid memory.
+    #[inline]
+    pub unsafe fn into_slice_mut<'a, U>(self, len: impl Into<usize>) -> &'a mut [U]
+    where
+        Self: Into<*mut U>,
+    {
+        core::slice::from_raw_parts_mut(self.into(), len.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Register;
+
+    #[test]
+    fn integers() {
+        Register::<usize>::from(0u8);
+        Register::<usize>::from(0u16);
+        Register::<usize>::from(0u32);
+        Register::<usize>::from(0i8);
+        Register::<usize>::from(0i16);
+        Register::<usize>::from(0i32);
+
+        Register::<u64>::from(0usize);
+        Register::<u64>::from(0isize);
+    }
+
+    #[test]
+    fn pointers() {
+        <*const u8>::from(Register::<usize>::from(0));
+        Register::<usize>::from(&0u8);
+        Register::<usize>::from(&0u8 as *const u8);
+
+        <*mut u8>::from(Register::<usize>::from(0));
+        Register::<usize>::from(&mut 0u8);
+        Register::<usize>::from(&mut 0u8 as *mut u8);
+    }
+
+    #[test]
+    fn slice() {
+        let mut buf = [7u8, 5, 3, 9, 4, 7, 2, 6];
+
+        let reg = Register::<usize>::from(&buf[..]);
+        let slc: &[u8] = unsafe { reg.into_slice(8usize) };
+        assert_eq!(slc[2], buf[2]);
+
+        let reg = Register::<usize>::from(&mut buf[..]);
+        let slc: &mut [u8] = unsafe { reg.into_slice_mut(8usize) };
+        assert_eq!(slc[3], buf[3]);
+
+        slc[3] = 0;
+        assert_eq!(buf[3], 0);
     }
 }

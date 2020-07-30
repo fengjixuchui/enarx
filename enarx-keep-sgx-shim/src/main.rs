@@ -48,13 +48,32 @@ fn main() {}
 
 // ============== REAL CODE HERE ===============
 
+macro_rules! debug {
+    ($dst:expr, $($arg:tt)*) => {
+        #[allow(unused_must_use)] {
+            use core::fmt::Write;
+            write!($dst, $($arg)*);
+        }
+    };
+}
+
+macro_rules! debugln {
+    ($dst:expr) => { debugln!($dst,) };
+    ($dst:expr, $($arg:tt)*) => {
+        #[allow(unused_must_use)] {
+            use core::fmt::Write;
+            writeln!($dst, $($arg)*);
+        }
+    };
+}
+
 mod elf;
 mod entry;
 mod event;
 mod handler;
 mod heap;
 
-use span::Line;
+use bounds::Line;
 
 /// The enclave layout
 /// NOTE: this must be kept in sync with enarx-keep-sgx
