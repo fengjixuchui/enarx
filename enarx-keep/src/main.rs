@@ -4,17 +4,27 @@
 
 #![deny(clippy::all)]
 #![deny(missing_docs)]
+#![feature(asm)]
 
 mod backend;
 mod binary;
+mod sallyport;
 
-use std::collections::HashMap;
-use std::io::Result;
-use structopt::StructOpt;
+// workaround for sallyport tests, until we have internal crates
+pub use sallyport::Request;
 
 use backend::{Backend, Command};
 use binary::Component;
+
+use anyhow::Result;
+use structopt::StructOpt;
+
+use std::ffi::CString;
+use std::io::Error;
+use std::os::raw::c_char;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::ptr::null;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -30,11 +40,12 @@ struct Exec {
     #[structopt(short, long)]
     keep: Option<String>,
 
-    #[structopt(short, long, parse(from_os_str))]
-    shim: Option<PathBuf>,
+    /// The socket to use for preattestation
+    #[structopt(short, long)]
+    sock: Option<PathBuf>,
 
     /// The payload to run inside the keep
-    code: String,
+    code: PathBuf,
 }
 
 #[derive(StructOpt)]
@@ -45,11 +56,11 @@ enum Options {
 }
 
 fn main() -> Result<()> {
-    let mut backends = HashMap::<String, Box<dyn Backend>>::new();
-
-    backends.insert("kvm".into(), Box::new(backend::kvm::Backend));
-    backends.insert("sev".into(), Box::new(backend::sev::Backend));
-    backends.insert("sgx".into(), Box::new(backend::sgx::Backend));
+    let backends: &[Box<dyn Backend>] = &[
+        Box::new(backend::sev::Backend),
+        Box::new(backend::sgx::Backend),
+        Box::new(backend::kvm::Backend),
+    ];
 
     match Options::from_args() {
         Options::Info(_) => info(backends),
@@ -57,11 +68,11 @@ fn main() -> Result<()> {
     }
 }
 
-fn info(backends: HashMap<String, Box<dyn Backend>>) -> Result<()> {
+fn info(backends: &[Box<dyn Backend>]) -> Result<()> {
     use colorful::*;
 
-    for (name, backend) in &backends {
-        println!("Backend: {}", name);
+    for backend in backends {
+        println!("Backend: {}", backend.name());
 
         let data = backend.data();
 
@@ -89,27 +100,33 @@ fn info(backends: HashMap<String, Box<dyn Backend>>) -> Result<()> {
 }
 
 #[allow(unreachable_code)]
-fn exec(backends: HashMap<String, Box<dyn Backend>>, opts: Exec) -> Result<()> {
-    let code = Component::from_path(&opts.code)?;
-
+fn exec(backends: &[Box<dyn Backend>], opts: Exec) -> Result<()> {
     let backend = backends
-        .into_iter()
-        .filter(|(name, _)| opts.keep.is_none() || opts.keep.as_ref() == Some(name))
-        .filter(|(_, backend)| backend.have())
-        .map(|(_, backend)| backend)
-        .next()
-        .expect("No supported backend found!");
+        .iter()
+        .filter(|b| opts.keep.is_none() || opts.keep == Some(b.name().into()))
+        .find(|b| b.have());
 
-    let shim = Component::from_path(opts.shim.unwrap_or(backend.shim()?))?;
+    if let Some(backend) = backend {
+        let code = Component::from_path(&opts.code)?;
+        let keep = backend.build(code, opts.sock.as_deref())?;
 
-    let keep = backend.build(shim, code)?;
-
-    let mut thread = keep.clone().add_thread()?;
-    loop {
-        match thread.enter()? {
-            Command::SysCall(block) => unsafe {
-                block.msg.rep = block.msg.req.syscall();
-            },
+        let mut thread = keep.clone().add_thread()?;
+        loop {
+            match thread.enter()? {
+                Command::SysCall(block) => unsafe {
+                    block.msg.rep = block.msg.req.syscall();
+                },
+                Command::Continue => (),
+            }
+        }
+    } else {
+        match opts.keep {
+            Some(name) if name != "nil" => panic!("Keep backend '{}' is unsupported.", name),
+            _ => {
+                let cstr = CString::new(opts.code.as_os_str().as_bytes()).unwrap();
+                unsafe { libc::execl(cstr.as_ptr(), cstr.as_ptr(), null::<c_char>()) };
+                return Err(Error::last_os_error().into());
+            }
         }
     }
 

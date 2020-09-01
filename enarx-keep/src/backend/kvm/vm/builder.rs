@@ -9,14 +9,17 @@ use super::cpu::Allocator;
 use super::mem::{KvmUserspaceMemoryRegion, Region};
 use super::VirtualMachine;
 
+use crate::backend::kvm::shim::BootInfo;
 use crate::binary::{Component, Segment};
 
-use bounds::Line;
-use enarx_keep_sev_shim::BootInfo;
+use anyhow::Result;
 use kvm_ioctls::{Kvm, VmFd};
-use memory::Page;
+use lset::Line;
+use mmarinus::{perms, Kind, Map};
+use nbytes::bytes;
+use primordial::Page;
 use x86_64::structures::paging::page_table::{PageTable, PageTableFlags};
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{align_up, PhysAddr, VirtAddr};
 
 use std::io;
 use std::marker::PhantomData;
@@ -80,11 +83,11 @@ pub struct Builder<T: State> {
 }
 
 /// The initial state simply creates a KVM context.
-impl<T: State> Builder<T> {
-    pub fn new() -> Result<Builder<New>, io::Error> {
+impl Builder<New> {
+    pub fn new() -> Result<Self> {
         let kvm = Kvm::new()?;
         let fd = kvm.create_vm()?;
-        Ok(Builder {
+        Ok(Self {
             data: Data {
                 kvm: Some(kvm),
                 fd: Some(fd),
@@ -104,7 +107,7 @@ impl Builder<New> {
     pub fn with_max_cpus(
         mut self,
         max_cpus: NonZeroUsize,
-    ) -> Result<Builder<CpuCapacity>, io::Error> {
+    ) -> Result<Builder<AddressSpace>, io::Error> {
         self.data.max_cpus = Some(max_cpus.get());
 
         Ok(Builder {
@@ -115,29 +118,21 @@ impl Builder<New> {
 }
 
 impl Builder<CpuCapacity> {
-    pub fn with_mem_size(mut self, mem_size: u64) -> Result<Builder<AddressSpace>, io::Error> {
-        let guest_addr_start = unsafe {
-            mmap::map(
-                0,
-                mem_size as _,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGE_2MB,
-                None,
-                0,
-            )?
-        };
-        let unmap = unsafe {
-            mmap::Unmap::new(bounds::Span {
-                start: guest_addr_start,
-                count: mem_size as _,
-            })
-        };
+    pub fn add_memory(mut self) -> std::io::Result<Builder<BootBlock>> {
+        let mem_size = align_up(self.data.boot_info.unwrap().mem_size as _, bytes![2; MiB]);
+        self.data.boot_info.as_mut().unwrap().mem_size = mem_size as _;
+
+        let map = Map::map(mem_size as usize)
+            .anywhere()
+            .anonymously()
+            .known::<perms::ReadWrite>(Kind::Private)?;
+
         let region = KvmUserspaceMemoryRegion {
             slot: 0,
             flags: 0,
             guest_phys_addr: 0,
             memory_size: mem_size as _,
-            userspace_addr: guest_addr_start as _,
+            userspace_addr: map.addr() as _,
         };
 
         let fd = self.data.fd.as_ref().unwrap();
@@ -148,7 +143,7 @@ impl Builder<CpuCapacity> {
         self.data.address_space = Some(Region::new(
             *self.data.max_cpus.as_ref().unwrap(),
             region,
-            unmap,
+            map,
         ));
 
         Ok(Builder {
@@ -165,17 +160,14 @@ impl Builder<AddressSpace> {
         mut self,
         shim_region: Line<usize>,
         code_region: Line<usize>,
-    ) -> Result<Builder<BootBlock>, io::Error> {
-        let addr_space = self.data.address_space.as_ref().unwrap();
-        let memsz = addr_space.as_virt().count;
-
+    ) -> Result<Builder<CpuCapacity>, io::Error> {
         let vm_setup = Line {
             start: 0,
-            end: addr_space.prefix_mut().size(),
+            end: Region::size_of_setup(*self.data.max_cpus.as_ref().unwrap()),
         };
-        let boot_info =
-            BootInfo::calculate(memsz as _, vm_setup, shim_region.into(), code_region.into())
-                .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+
+        let boot_info = BootInfo::calculate(vm_setup, shim_region.into(), code_region.into())
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
 
         self.data.boot_info = Some(boot_info);
 
@@ -263,12 +255,12 @@ impl Builder<Code> {
             kvm: self.data.kvm.unwrap(),
             fd: self.data.fd.unwrap(),
             id_alloc: Allocator::new(),
-            address_space: self.data.address_space.unwrap(),
+            regions: vec![self.data.address_space.unwrap()],
             shim_entry: self.data.shim_entry.unwrap(),
             shim_start: PhysAddr::new(boot_info.shim.start as _),
         };
 
-        let host_setup = vm.address_space.prefix_mut();
+        let host_setup = vm.regions[0].prefix_mut();
         host_setup.shared_pages[0] = Page::copy(boot_info);
         host_setup.shared_pages[1..]
             .iter_mut()
@@ -277,7 +269,7 @@ impl Builder<Code> {
         *host_setup.pml4t = PageTable::new();
         *host_setup.pml3t_ident = PageTable::new();
 
-        let addr_virt = vm.address_space.as_virt();
+        let addr_virt = vm.regions[0].as_virt();
         let to_guest = |virt_addr| PhysAddr::new(virt_addr - addr_virt.start.as_u64());
 
         // Set up the page tables

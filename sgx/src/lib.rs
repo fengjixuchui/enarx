@@ -4,6 +4,7 @@
 //! Section references in further documentation refer to this document.
 //! https://www.intel.com/content/dam/www/public/emea/xe/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3d-part-4-manual.pdf
 
+#![cfg_attr(feature = "asm", feature(asm))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(clippy::all)]
 #![allow(clippy::identity_op)]
@@ -20,11 +21,11 @@
 #[cfg(test)]
 #[macro_use]
 macro_rules! testaso {
-    (@off $name:ty=>$field:ident) => {
-        &unsafe { &*core::ptr::null::<$name>() }.$field as *const _ as usize
+    (@off $name:path=>$field:ident) => {
+        memoffset::offset_of!($name, $field)
     };
 
-    ($(struct $name:ty: $align:expr, $size:expr => { $($field:ident: $offset:expr),* })+) => {
+    ($(struct $name:path: $align:expr, $size:expr => { $($field:ident: $offset:expr),* })+) => {
         #[cfg(test)]
         #[test]
         fn align() {
@@ -78,7 +79,10 @@ pub mod crypto;
 
 #[cfg(feature = "std")]
 pub mod attestation_types;
+
 #[cfg(feature = "std")]
-pub mod ioctls;
+// FIXME:
+#[allow(clippy::module_inception)]
+pub mod enclave;
 
 pub mod types;

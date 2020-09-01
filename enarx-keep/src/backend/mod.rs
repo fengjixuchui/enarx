@@ -6,15 +6,18 @@ pub mod sgx;
 
 mod probe;
 
-use std::io::Result;
-use std::path::PathBuf;
+use crate::binary::Component;
+use crate::sallyport::Block;
+
+use std::path::Path;
 use std::sync::Arc;
 
-use sallyport::Block;
-
-use super::binary::Component;
+use anyhow::Result;
 
 pub trait Backend {
+    /// The name of the backend
+    fn name(&self) -> &'static str;
+
     /// Whether or not the platform has support for this keep type
     fn have(&self) -> bool {
         !self.data().iter().fold(false, |e, d| e | !d.pass)
@@ -23,11 +26,8 @@ pub trait Backend {
     /// The tests that show platform support for the backend
     fn data(&self) -> Vec<Datum>;
 
-    /// Returns the path for the shim
-    fn shim(&self) -> Result<PathBuf>;
-
     /// Create a keep instance on this backend
-    fn build(&self, shim: Component, code: Component) -> Result<Arc<dyn Keep>>;
+    fn build(&self, code: Component, sock: Option<&Path>) -> Result<Arc<dyn Keep>>;
 }
 
 pub struct Datum {
@@ -56,4 +56,5 @@ pub trait Thread {
 
 pub enum Command<'a> {
     SysCall(&'a mut Block),
+    Continue,
 }

@@ -4,21 +4,23 @@ version = "0.1.0"
 authors = ["Nathaniel McCallum <npmccallum@redhat.com>"]
 license = "Apache-2.0"
 edition = "2018"
+build = "build.rs"
+
+include = [ "src", "internal" ]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-enarx-keep-sev-shim = { path = "../enarx-keep-sev-shim" }
-sallyport = { path = "../sallyport" }
-sgx = { path = "../sgx", default-features = false }
-bounds = { path = "../bounds" }
-memory = { path = "../memory" }
-mmap = { path = "../mmap" }
-units = { path = "../units" }
-kvm-bindings = "0.3.0"
-kvm-ioctls = "0.5.0"
+sgx = { path = "../sgx", features = ["asm"] }
+x86_64 = { version = "0.11", default-features = false, features = ["stable"] }
+kvm-bindings = "0.3"
+kvm-ioctls = "0.5"
+primordial = "0.1"
 structopt = "0.3"
 colorful = "0.2"
+mmarinus = "0.2"
+nbytes = "0.1"
+anyhow = "1.0"
 goblin = "0.2"
 libc = "0.2"
-x86_64 = { version = "0.11.0", default-features = false, features = ["stable"] }
+lset = "0.1"

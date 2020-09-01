@@ -4,11 +4,12 @@ use crate::backend::probe::x86_64::{CpuId, Vendor};
 use crate::backend::{self, Datum, Keep};
 use crate::binary::Component;
 
+use anyhow::Result;
+
 use std::arch::x86_64::__cpuid_count;
 use std::fs::OpenOptions;
-use std::io::Result;
 use std::mem::transmute;
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::from_utf8;
 use std::sync::Arc;
 
@@ -172,6 +173,15 @@ fn has_kvm_support() -> Datum {
 pub struct Backend;
 
 impl backend::Backend for Backend {
+    fn name(&self) -> &'static str {
+        "sev"
+    }
+
+    // This will be updated once there is support for SEV.
+    fn have(&self) -> bool {
+        false
+    }
+
     fn data(&self) -> Vec<Datum> {
         let mut data = vec![];
         data.extend(CPUIDS.iter().map(|c| c.into()));
@@ -183,11 +193,7 @@ impl backend::Backend for Backend {
         data
     }
 
-    fn shim(&self) -> Result<PathBuf> {
-        unimplemented!()
-    }
-
-    fn build(&self, shim: Component, code: Component) -> Result<Arc<dyn Keep>> {
+    fn build(&self, _code: Component, _sock: Option<&Path>) -> Result<Arc<dyn Keep>> {
         unimplemented!()
     }
 }

@@ -1,25 +1,15 @@
 [env]
+RUST_RECURSION_COUNT = {unset = true }
 CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
 CARGO_MAKE_WORKSPACE_EMULATION = true
 CARGO_MAKE_CRATE_WORKSPACE_MEMBERS = [
-	"bounds",
-	"crt0stack",
 	"enarx-keep",
-	"enarx-keep-sev-shim",
-	"enarx-keep-sgx",
-	"enarx-keep-sgx-shim",
-	"enumerate",
+	"enarx-keep/internal/shim-sev",
+	"enarx-keep/internal/shim-sgx",
+	"enarx-keep/internal/rcrt1",
+	"enarx-keep/internal/sallyport",
 	"integration-tests",
-	"intel-types",
-	"keep-runtime",
-	"loader",
-	"memory",
-	"sallyport",
-	"sev",
-	"sevctl",
 	"sgx",
-	"units",
-	"vdso"
 ]
 ENARX_TEST_DIR = "${CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY}/.tests"
 ENARX_DOCS_DIR = "${CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY}/docs"
@@ -96,7 +86,7 @@ dependencies = [
 # The "integration" task will invoke this automatically.
 [tasks.pre-integration]
 workspace = false
-env = { "CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS" = ["enarx-keep", "enarx-keep-sgx", "enarx-keep-sgx-shim", "enarx-keep-sev-shim"] }
+env = { "CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS" = ["enarx-keep"] }
 run_task = { name = "build", fork = true }
 
 # Launches the integration tests. You probably want to run
@@ -122,6 +112,12 @@ args = ["test"]
 # Stubbed. Crates must override this specifically if there's
 # anything special to be done to "turn on" the deep testing
 # requirements.
+
+# This is invoked by the ci-flow, but it will only run if
+# it detects it is using nightly Rust. Override this flow
+# to run on both stable and nightly so it runs with ci-flow.
+[tasks.clippy-ci-flow]
+condition = { channels = ["stable", "nightly"] }
 
 [tasks.deny]
 command = "cargo"
@@ -168,3 +164,10 @@ dependencies = [
 	"misc-lints-clippy-all",
 	"misc-lints-missing-docs",
 ]
+
+# Remove Cargo.lock files in cases where compilation fails
+# due to incorrect library update propogation
+[tasks.dist-clean]
+dependencies = ["clean"]
+command = "rm"
+args = ["-f", "Cargo.lock"]
